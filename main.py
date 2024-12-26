@@ -1,31 +1,8 @@
 import sys
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QLabel,
-                             QVBoxLayout, QHBoxLayout, QTabWidget,
-                             QLineEdit, QTableWidget, QTableWidgetItem, QSpinBox,
-                             QComboBox, QMessageBox,
-                             QTimeEdit, QWidget)
-from PyQt5.QtCore import Qt, QTime
-from PyQt5.QtGui import QFont
-from datetime import datetime, timedelta
-import json
-from pathlib import Path
-
-# Словарь для перевода дней недели на русский
-days_translation = {
-    "Monday": "Понедельник",
-    "Tuesday": "Вторник",
-    "Wednesday": "Среда",
-    "Thursday": "Четверг",
-    "Friday": "Пятница",
-    "Saturday": "Суббота",
-    "Sunday": "Воскресенье"
-}
-
-def main():
-    app = QApplication(sys.argv)
-    main_window = MainWindow()
-    main_window.show()
-    sys.exit(app.exec_())
+from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QVBoxLayout, QWidget, QTabWidget, QScrollArea, QLineEdit, QComboBox, QDialog, QHBoxLayout, QMessageBox, QTimeEdit, QGridLayout
+from PyQt5.QtCore import QDate, QTime
+import psycopg2
+from psycopg2 import sql
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -33,648 +10,660 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Билетная касса театра")
         self.setGeometry(100, 100, 800, 600)
-        self.setStyleSheet("background-color: #f0f0f0;")
+        self.setFixedSize(800, 600)  # Запрещаем изменение размера окна
 
-        # Данные
-        self.halls = []
-        self.shows = {}
-        self.sessions = load_sessions_from_file()
+        self.conn = psycopg2.connect(
+            dbname="theater",
+            user="postgres",
+            password="2408",
+            host="localhost",
+            port="5432"
+        )
+        self.cur = self.conn.cursor()
 
-        self.main_screen()
-        self.current_week_tab = None
-        self.next_week_tab = None
+        self.halls = self.load_halls()
+        self.performances = self.load_performances()
+        self.sessions = self.load_sessions()
+        self.hall_types = self.load_hall_types()
+        self.show_main_menu()
 
-    def main_screen(self):
+    def load_halls(self):
+        self.cur.execute("SELECT h.id, h.name, ht.id, ht.description, ht.rows, ht.seats FROM halls h JOIN hall_types ht ON h.hall_type_id = ht.id")
+        return [dict(id=row[0], name=row[1], type=row[2], type_description=row[3], rows=row[4], seats=row[5]) for row in self.cur.fetchall()]
+
+    def load_performances(self):
+        self.cur.execute("SELECT * FROM performances")
+        return [dict(id=row[0], name=row[1]) for row in self.cur.fetchall()]
+
+    def load_sessions(self):
+        self.cur.execute("SELECT s.id, s.date, s.hall_id, s.performance_id, s.time, s.price FROM sessions s")
+        sessions = [dict(id=row[0], date=row[1], hall_id=row[2], performance_id=row[3], time=row[4], price=row[5]) for row in self.cur.fetchall()]
+        sessions_dict = {}
+        for session in sessions:
+            if session['date'] not in sessions_dict:
+                sessions_dict[session['date']] = []
+            sessions_dict[session['date']].append(session)
+        return sessions_dict
+
+    def load_hall_types(self):
+        self.cur.execute("SELECT * FROM hall_types")
+        return [dict(id=row[0], description=row[1], rows=row[2], seats=row[3]) for row in self.cur.fetchall()]
+
+    def add_hall(self):
+        name = f"Зал {len(self.halls) + 1}"
+        hall_type_id = 1  # По умолчанию выбираем первый тип зала
+        self.cur.execute("INSERT INTO halls (name, hall_type_id) VALUES (%s, %s) RETURNING id", (name, hall_type_id))
+        hall_id = self.cur.fetchone()[0]
+        self.conn.commit()
+        hall = {"id": hall_id, "name": name, "type": hall_type_id, "type_description": self.hall_types[0]['description'], "rows": self.hall_types[0]['rows'], "seats": self.hall_types[0]['seats']}
+        self.halls.append(hall)
+        self.create_hall_button(hall)
+
+    def save_hall_changes(self, hall, name_edit, type_combo, dialog, size_label):
+        hall["name"] = name_edit.text()
+        hall["type"] = self.hall_types[type_combo.currentIndex()]['id']
+        hall["type_description"] = self.hall_types[type_combo.currentIndex()]['description']
+        hall["rows"] = self.hall_types[type_combo.currentIndex()]['rows']
+        hall["seats"] = self.hall_types[type_combo.currentIndex()]['seats']
+        self.cur.execute("UPDATE halls SET name = %s, hall_type_id = %s WHERE id = %s", (hall["name"], hall["type"], hall["id"]))
+        self.conn.commit()
+        self.hall_buttons[hall["id"]].setText(hall["name"])
+        dialog.accept()
+
+    def delete_hall(self, hall, dialog):
+        reply = QMessageBox.question(self, 'Удаление зала', f"Вы уверены, что хотите удалить зал {hall['name']}?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.cur.execute("DELETE FROM halls WHERE id = %s", (hall["id"],))
+            self.conn.commit()
+            self.halls.remove(hall)
+            self.hall_buttons[hall["id"]].deleteLater()
+            del self.hall_buttons[hall["id"]]
+            dialog.accept()
+
+    def add_performance(self):
+        name = f"Спектакль {len(self.performances) + 1}"
+        self.cur.execute("INSERT INTO performances (name) VALUES (%s) RETURNING id", (name,))
+        performance_id = self.cur.fetchone()[0]
+        self.conn.commit()
+        performance = {"id": performance_id, "name": name}
+        self.performances.append(performance)
+        self.create_performance_button(performance)
+
+    def save_performance_changes(self, performance, name_edit, dialog):
+        performance["name"] = name_edit.text()
+        self.cur.execute("UPDATE performances SET name = %s WHERE id = %s", (performance["name"], performance["id"]))
+        self.conn.commit()
+        self.performance_buttons[performance["id"]].setText(performance["name"])
+        dialog.accept()
+
+    def delete_performance(self, performance, dialog):
+        reply = QMessageBox.question(self, 'Удаление спектакля', f"Вы уверены, что хотите удалить спектакль {performance['name']}?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.cur.execute("DELETE FROM performances WHERE id = %s", (performance["id"],))
+            self.conn.commit()
+            self.performances.remove(performance)
+            self.performance_buttons[performance["id"]].deleteLater()
+            del self.performance_buttons[performance["id"]]
+            dialog.accept()
+
+    def add_session(self, date):
+        if not self.halls:
+            QMessageBox.warning(self, "Ошибка", "Нет доступных залов. Пожалуйста, добавьте хотя бы один зал.")
+            return
+
+        if not self.performances:
+            QMessageBox.warning(self, "Ошибка", "Нет доступных спектаклей. Пожалуйста, добавьте хотя бы один спектакль.")
+            return
+
+        hall = self.halls[0] if self.halls else None
+        performance = self.performances[0] if self.performances else None
+        self.cur.execute("INSERT INTO sessions (date, hall_id, performance_id, time, price) VALUES (%s, %s, %s, %s, %s) RETURNING id", (date, hall["id"], performance["id"], QTime(19, 00), 350))
+        session_id = self.cur.fetchone()[0]
+        self.conn.commit()
+        session = {
+            "id": session_id,
+            "date": date,
+            "hall": hall,
+            "performance": performance,
+            "time": QTime(19, 00),
+            "price": 350,
+            "seats": set()
+        }
+        if date not in self.sessions:
+            self.sessions[date] = []
+        self.sessions[date].append(session)
+        self.create_session_button(session)
+
+    def save_session_changes(self, session, hall_combo, performance_combo, time_edit, price_edit, dialog):
+        session["hall"] = self.halls[hall_combo.currentIndex()]
+        session["performance"] = self.performances[performance_combo.currentIndex()]
+        session["time"] = time_edit.time()
+        session["price"] = float(price_edit.text()) if price_edit.text() else 350
+        self.cur.execute("UPDATE sessions SET hall_id = %s, performance_id = %s, time = %s, price = %s WHERE id = %s", (session["hall"]["id"], session["performance"]["id"], session["time"], session["price"], session["id"]))
+        self.conn.commit()
+
+        session_name = f"{session['hall']['name']} - {session['performance']['name']} - {session['time'].toString('HH:mm')}"
+        self.session_buttons[session["id"]].setText(session_name)
+        dialog.accept()
+
+    def delete_session(self, session, dialog):
+        reply = QMessageBox.question(self, 'Удаление сеанса', f"Вы уверены, что хотите удалить сеанс {session['id']}?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.cur.execute("DELETE FROM sessions WHERE id = %s", (session["id"],))
+            self.conn.commit()
+            self.sessions[session["date"]].remove(session)
+            self.session_buttons[session["id"]].deleteLater()
+            del self.session_buttons[session["id"]]
+            dialog.accept()
+
+    def reserve_seat(self, session, row, seat, seat_button):
+        if (row, seat) in session["seats"]:
+            session["seats"].remove((row, seat))
+            seat_button.setStyleSheet('color: #555555; border: 1px solid #D3D3D3; background-color: #D3D3D3; font-size: 10px;')
+            self.cur.execute("DELETE FROM reserved_seats WHERE session_id = %s AND row = %s AND seat = %s", (session["id"], row, seat))
+            self.conn.commit()
+        else:
+            session["seats"].add((row, seat))
+            seat_button.setStyleSheet('color: #FFFFF; border: 1px solid #D3D3D3; background-color: #FF0000; font-size: 10px;')
+            self.cur.execute("INSERT INTO reserved_seats (session_id, row, seat) VALUES (%s, %s, %s)", (session["id"], row, seat))
+            self.conn.commit()
+
+    def show_main_menu(self):
         self.clear_window()
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
 
         layout = QVBoxLayout()
 
-        sessions_button = QPushButton("Перейти к сеансам")
-        sessions_button.setFont(QFont("Arial", 14))
-        sessions_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 10px;")
-        sessions_button.clicked.connect(self.open_view_schedule_screen)
-        layout.addWidget(sessions_button, alignment=Qt.AlignCenter)
+        self.create_label("Билетная касса театра", 250, 50, 400, 50, 24, 'black', 'bold')
+        self.create_button("Перейти к сеансам", 250, 200, 300, 100, '#D3D3D3', self.show_sessions_menu)
+        self.create_button("Редактировать", 250, 350, 300, 100, '#D3D3D3', self.show_edit_menu)
 
-        edit_button = QPushButton("Редактировать")
-        edit_button.setFont(QFont("Arial", 14))
-        edit_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 10px;")
-        edit_button.clicked.connect(self.open_edit_screen)
-        layout.addWidget(edit_button, alignment=Qt.AlignCenter)
+        central_widget.setLayout(layout)
 
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
-
-    def open_view_schedule_screen(self):
+    def show_sessions_menu(self):
         self.clear_window()
 
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
         layout = QVBoxLayout()
-        label = QLabel("Экран сеансов: Выберите неделю")
-        label.setFont(QFont("Arial", 16))
-        label.setStyleSheet("color: #333;")
-        layout.addWidget(label, alignment=Qt.AlignCenter)
 
-        back_button = QPushButton("Назад")
-        back_button.setFont(QFont("Arial", 12))
-        back_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
-        back_button.clicked.connect(self.main_screen)
-        layout.addWidget(back_button, alignment=Qt.AlignCenter)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.create_current_week_tab(False), "На тек. нед.")
+        self.tabs.addTab(self.create_next_week_tab(False), "На след. нед.")
 
-        self.current_week_tab = ViewScheduleTab(self, "На тек. неделю", is_next_week=False)
-        self.next_week_tab = ViewScheduleTab(self, "На след. неделю", is_next_week=True)
+        back_button = QPushButton("Назад", self)
+        back_button.setGeometry(700, 10, 80, 40)
+        back_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 16px; border-radius: 20px;')
+        back_button.clicked.connect(self.show_main_menu)
 
-        tabs = QTabWidget()
-        tabs.addTab(self.current_week_tab, "На тек. неделю")
-        tabs.addTab(self.next_week_tab, "На след. неделю")
-        tabs.setStyleSheet(
-            "QTabWidget::pane { border: 1px solid #ccc; } QTabBar::tab { background: #0078d7; color: white; padding: 8px; border-radius: 5px; } QTabBar::tab:selected { background: #005bb5; }")
-        layout.addWidget(tabs)
+        layout.addWidget(self.tabs)
+        layout.addWidget(back_button)
 
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
+        central_widget.setLayout(layout)
 
-    def open_edit_screen(self):
+    def show_edit_menu(self):
         self.clear_window()
 
-        layout = QVBoxLayout()
-        label = QLabel("Экран запросов")
-        label.setFont(QFont("Arial", 16))
-        label.setStyleSheet("color: #333;")
-        layout.addWidget(label, alignment=Qt.AlignCenter)
-
-        back_button = QPushButton("Назад")
-        back_button.setFont(QFont("Arial", 12))
-        back_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
-        back_button.clicked.connect(self.main_screen)
-        layout.addWidget(back_button, alignment=Qt.AlignCenter)
-
-        tabs = QTabWidget()
-        tabs.setStyleSheet(
-            "QTabWidget::pane { border: 1px solid #ccc; } QTabBar::tab { background: #0078d7; color: white; padding: 8px; border-radius: 5px; } QTabBar::tab:selected { background: #005bb5; }")
-
-        halls_tab = HallsTab(self)
-        tabs.addTab(halls_tab, "Залы")
-
-        shows_tab = ShowsTab(self)
-        tabs.addTab(shows_tab, "Спектакли")
-
-        current_week_tab = ScheduleTab(self, "На тек. неделю", is_next_week=False)
-        tabs.addTab(current_week_tab, "На тек. неделю")
-
-        next_week_tab = ScheduleTab(self, "На след. неделю", is_next_week=True)
-        tabs.addTab(next_week_tab, "На след. неделю")
-
-        layout.addWidget(tabs)
-
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
-
-    def open_edit_screen(self):
-        self.clear_window()
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
 
         layout = QVBoxLayout()
-        label = QLabel("Экран запросов")
-        label.setFont(QFont("Arial", 16))
-        label.setStyleSheet("color: #333;")
-        layout.addWidget(label, alignment=Qt.AlignCenter)
 
-        back_button = QPushButton("Назад")
-        back_button.setFont(QFont("Arial", 12))
-        back_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
-        back_button.clicked.connect(self.main_screen)
-        layout.addWidget(back_button, alignment=Qt.AlignCenter)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.create_halls_tab(), "Залы")
+        self.tabs.addTab(self.create_performances_tab(), "Спектакли")
+        self.tabs.addTab(self.create_current_week_tab(), "На тек. нед.")
+        self.tabs.addTab(self.create_next_week_tab(), "На след. нед.")
 
-        tabs = QTabWidget()
-        tabs.setStyleSheet("QTabWidget::pane { border: 1px solid #ccc; } QTabBar::tab { background: #0078d7; color: white; padding: 8px; border-radius: 5px; } QTabBar::tab:selected { background: #005bb5; }")
+        back_button = QPushButton("Назад", self)
+        back_button.setGeometry(700, 10, 80, 40)
+        back_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 16px; border-radius: 20px;')
+        back_button.clicked.connect(self.show_main_menu)
 
-        halls_tab = HallsTab(self)
-        tabs.addTab(halls_tab, "Залы")
+        layout.addWidget(self.tabs)
+        layout.addWidget(back_button)
 
-        shows_tab = ShowsTab(self)
-        tabs.addTab(shows_tab, "Спектакли")
+        central_widget.setLayout(layout)
 
-        current_week_tab = ScheduleTab(self, "На тек. неделю", is_next_week=False)
-        tabs.addTab(current_week_tab, "На тек. неделю")
+    def create_halls_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout()
 
-        next_week_tab = ScheduleTab(self, "На след. неделю", is_next_week=True)
-        tabs.addTab(next_week_tab, "На след. неделю")
+        add_hall_button = QPushButton("+", self)
+        add_hall_button.setGeometry(350, 10, 50, 50)
+        add_hall_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 24px; border-radius: 25px;')
+        add_hall_button.clicked.connect(self.add_hall)
 
-        layout.addWidget(tabs)
+        self.hall_layout = QVBoxLayout()
+        self.hall_layout.addWidget(add_hall_button)
 
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
+        for hall in self.halls:
+            self.create_hall_button(hall)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_content.setLayout(self.hall_layout)
+        scroll_area.setWidget(scroll_content)
+
+        layout.addWidget(scroll_area)
+        tab.setLayout(layout)
+
+        return tab
+
+    def create_hall_button(self, hall):
+        hall_button = QPushButton(hall["name"], self)
+        hall_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
+        hall_button.clicked.connect(lambda: self.edit_hall(hall))
+        self.hall_layout.addWidget(hall_button)
+        self.hall_buttons[hall["id"]] = hall_button
+
+    def edit_hall(self, hall):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Редактирование зала {hall['name']}")
+        dialog.setGeometry(100, 100, 400, 300)
+        dialog.setFixedSize(400, 300)
+
+        layout = QVBoxLayout()
+
+        name_label = QLabel("Название зала:", self)
+        name_label.setStyleSheet('font-size: 16px;')
+        layout.addWidget(name_label)
+
+        name_edit = QLineEdit(hall["name"], self)
+        layout.addWidget(name_edit)
+
+        type_label = QLabel("Тип зала:", self)
+        type_label.setStyleSheet('font-size: 16px;')
+        layout.addWidget(type_label)
+
+        type_combo = QComboBox(self)
+        for hall_type in self.hall_types:
+            type_combo.addItem(hall_type["description"])
+        type_combo.currentIndexChanged.connect(lambda: self.update_hall_size(hall, type_combo, size_label))
+        layout.addWidget(type_combo)
+
+        size_label = QLabel("", self)
+        size_label.setStyleSheet('font-size: 16px;')
+        layout.addWidget(size_label)
+
+        type_combo.setCurrentIndex(hall["type"] - 1)
+        self.update_hall_size(hall, type_combo, size_label)
+
+        save_button = QPushButton("Сохранить", self)
+        save_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
+        save_button.clicked.connect(lambda: self.save_hall_changes(hall, name_edit, type_combo, dialog, size_label))
+        layout.addWidget(save_button)
+
+        delete_button = QPushButton("Удалить", self)
+        delete_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
+        delete_button.clicked.connect(lambda: self.delete_hall(hall, dialog))
+        layout.addWidget(delete_button)
+
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def update_hall_size(self, hall, type_combo, size_label):
+        hall_type = self.hall_types[type_combo.currentIndex()]
+        hall["type"] = hall_type["id"]
+        hall["type_description"] = hall_type["description"]
+        hall["rows"] = hall_type["rows"]
+        hall["seats"] = hall_type["seats"]
+        size_label.setText(f"Размер зала: {hall['rows']} рядов, {hall['seats']} мест")
+
+    def create_performances_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout()
+
+        add_performance_button = QPushButton("+", self)
+        add_performance_button.setGeometry(350, 10, 50, 50)
+        add_performance_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 24px; border-radius: 25px;')
+        add_performance_button.clicked.connect(self.add_performance)
+
+        self.performance_layout = QVBoxLayout()
+        self.performance_layout.addWidget(add_performance_button)
+
+        for performance in self.performances:
+            self.create_performance_button(performance)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_content.setLayout(self.performance_layout)
+        scroll_area.setWidget(scroll_content)
+
+        layout.addWidget(scroll_area)
+        tab.setLayout(layout)
+
+        return tab
+
+    def create_performance_button(self, performance):
+        performance_button = QPushButton(performance["name"], self)
+        performance_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
+        performance_button.clicked.connect(lambda: self.edit_performance(performance))
+        self.performance_layout.addWidget(performance_button)
+        self.performance_buttons[performance["id"]] = performance_button
+
+    def edit_hall(self, hall):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Редактирование зала {hall['name']}")
+        dialog.setGeometry(100, 100, 400, 300)
+        dialog.setFixedSize(400, 300)
+
+        layout = QVBoxLayout()
+
+        name_label = QLabel("Название зала:", self)
+        name_label.setStyleSheet('font-size: 16px;')
+        layout.addWidget(name_label)
+
+        name_edit = QLineEdit(hall["name"], self)
+        layout.addWidget(name_edit)
+
+        type_label = QLabel("Тип зала:", self)
+        type_label.setStyleSheet('font-size: 16px;')
+        layout.addWidget(type_label)
+
+        type_combo = QComboBox(self)
+        for hall_type in self.hall_types:
+            type_combo.addItem(hall_type["description"])
+        type_combo.currentIndexChanged.connect(lambda: self.update_hall_size(hall, type_combo, size_label))
+        layout.addWidget(type_combo)
+
+        size_label = QLabel("", self)
+        size_label.setStyleSheet('font-size: 16px;')
+        layout.addWidget(size_label)
+
+        type_combo.setCurrentIndex(
+            next(i for i, hall_type in enumerate(self.hall_types) if hall_type["id"] == hall["type"]))
+        self.update_hall_size(hall, type_combo, size_label)
+
+        save_button = QPushButton("Сохранить", self)
+        save_button.setStyleSheet(
+            'color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
+        save_button.clicked.connect(lambda: self.save_hall_changes(hall, name_edit, type_combo, dialog, size_label))
+        layout.addWidget(save_button)
+
+        delete_button = QPushButton("Удалить", self)
+        delete_button.setStyleSheet(
+            'color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
+        delete_button.clicked.connect(lambda: self.delete_hall(hall, dialog))
+        layout.addWidget(delete_button)
+
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def add_session(self, date):
+        if not self.halls:
+            QMessageBox.warning(self, "Ошибка", "Нет доступных залов. Пожалуйста, добавьте хотя бы один зал.")
+            return
+
+        if not self.performances:
+            QMessageBox.warning(self, "Ошибка",
+                                "Нет доступных спектаклей. Пожалуйста, добавьте хотя бы один спектакль.")
+            return
+
+        hall = self.halls[0] if self.halls else None
+        performance = self.performances[0] if self.performances else None
+        self.cur.execute(
+            "INSERT INTO sessions (date, hall_id, performance_id, time, price) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (date, hall["id"], performance["id"], QTime(19, 00), 350))
+        session_id = self.cur.fetchone()[0]
+        self.conn.commit()
+        session = {
+            "id": session_id,
+            "date": date,
+            "hall": hall,
+            "performance": performance,
+            "time": QTime(19, 00),
+            "price": 350,
+            "seats": set()
+        }
+        if date not in self.sessions:
+            self.sessions[date] = []
+        self.sessions[date].append(session)
+        self.create_session_button(session)
+
+    def create_session_button(self, session):
+        if session["hall"] and session["performance"] and session["time"]:
+            session_name = f"{session['hall']['name']} - {session['performance']['name']} - {session['time'].toString('HH:mm')}"
+        else:
+            session_name = f"Сеанс {session['id']}"
+
+        session_button = QPushButton(session_name, self)
+        session_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
+        session_button.clicked.connect(lambda: self.edit_session(session))
+        self.session_layout.addWidget(session_button)
+        self.session_buttons[session["id"]] = session_button
+
+    def edit_session(self, session):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Редактирование сеанса {session['id']}")
+        dialog.setGeometry(100, 100, 400, 300)
+        dialog.setFixedSize(400, 300)
+
+        layout = QVBoxLayout()
+
+        hall_label = QLabel("Зал:", self)
+        hall_label.setStyleSheet('font-size: 16px;')
+        layout.addWidget(hall_label)
+
+        hall_combo = QComboBox(self)
+        for hall in self.halls:
+            hall_combo.addItem(hall["name"])
+        hall_combo.setCurrentIndex(next(i for i, hall in enumerate(self.halls) if hall["id"] == session["hall"]["id"]))
+        layout.addWidget(hall_combo)
+
+        performance_label = QLabel("Спектакль:", self)
+        performance_label.setStyleSheet('font-size: 16px;')
+        layout.addWidget(performance_label)
+
+        performance_combo = QComboBox(self)
+        for performance in self.performances:
+            performance_combo.addItem(performance["name"])
+        performance_combo.setCurrentIndex(next(i for i, performance in enumerate(self.performances) if performance["id"] == session["performance"]["id"]))
+        layout.addWidget(performance_combo)
+
+        time_label = QLabel("Время:", self)
+        time_label.setStyleSheet('font-size: 16px;')
+        layout.addWidget(time_label)
+
+        time_edit = QTimeEdit(self)
+        time_edit.setDisplayFormat("HH:mm")
+        time_edit.setTime(session["time"])
+        layout.addWidget(time_edit)
+
+        price_label = QLabel("Стоимость:", self)
+        price_label.setStyleSheet('font-size: 16px;')
+        layout.addWidget(price_label)
+
+        price_edit = QLineEdit(self)
+        price_edit.setText(str(session["price"]))
+        layout.addWidget(price_edit)
+
+        save_button = QPushButton("Сохранить", self)
+        save_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
+        save_button.clicked.connect(lambda: self.save_session_changes(session, hall_combo, performance_combo, time_edit, price_edit, dialog))
+        layout.addWidget(save_button)
+
+        delete_button = QPushButton("Удалить", self)
+        delete_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
+        delete_button.clicked.connect(lambda: self.delete_session(session, dialog))
+        layout.addWidget(delete_button)
+
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def save_session_changes(self, session, hall_combo, performance_combo, time_edit, price_edit, dialog):
+        session["hall"] = self.halls[hall_combo.currentIndex()]
+        session["performance"] = self.performances[performance_combo.currentIndex()]
+        session["time"] = time_edit.time()
+        session["price"] = float(price_edit.text()) if price_edit.text() else 350
+
+        session_name = f"{session['hall']['name']} - {session['performance']['name']} - {session['time'].toString('HH:mm')}"
+        self.cur.execute("UPDATE sessions SET hall_id = %s, performance_id = %s, time = %s, price = %s WHERE id = %s", (session["hall"]["id"], session["performance"]["id"], session["time"], session["price"], session["id"]))
+        self.conn.commit()
+
+        self.session_buttons[session["id"]].setText(session_name)
+        dialog.accept()
+
+    def delete_session(self, session, dialog):
+        reply = QMessageBox.question(self, 'Удаление сеанса', f"Вы уверены, что хотите удалить сеанс {session['id']}?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.cur.execute("DELETE FROM sessions WHERE id = %s", (session["id"],))
+            self.conn.commit()
+            self.sessions[session["date"]].remove(session)
+            self.session_buttons[session["id"]].deleteLater()
+            del self.session_buttons[session["id"]]
+            dialog.accept()
+
+    def create_current_week_tab(self, editable=True):
+        tab = QWidget()
+        layout = QVBoxLayout()
+
+        current_date = QDate.currentDate()
+        start_of_week = current_date.addDays(-(current_date.dayOfWeek() - 1))
+        days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
+
+        for i in range(6):
+            day_date = start_of_week.addDays(i)
+            day_button = QPushButton(f"{days[i]} {day_date.toString('dd.MM.yyyy')}", self)
+            day_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 16px; border-radius: 20px;')
+            day_button.clicked.connect(lambda checked, date=day_date: self.show_day_sessions(date, editable))
+            layout.addWidget(day_button)
+
+        tab.setLayout(layout)
+        return tab
+
+    def create_next_week_tab(self, editable=True):
+        tab = QWidget()
+        layout = QVBoxLayout()
+
+        current_date = QDate.currentDate()
+        start_of_week = current_date.addDays(-(current_date.dayOfWeek() - 1))
+        start_of_next_week = start_of_week.addDays(7)
+        days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
+
+        for i in range(6):
+            day_date = start_of_next_week.addDays(i)
+            day_button = QPushButton(f"{days[i]} {day_date.toString('dd.MM.yyyy')}", self)
+            day_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 16px; border-radius: 20px;')
+            day_button.clicked.connect(lambda checked, date=day_date: self.show_day_sessions(date, editable))
+            layout.addWidget(day_button)
+
+        tab.setLayout(layout)
+        return tab
+
+    def show_day_sessions(self, date, editable=True):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Сеансы на {date.toString('dd.MM.yyyy')}")
+        dialog.setGeometry(100, 100, 600, 400)
+        dialog.setFixedSize(600, 400)
+
+        layout = QVBoxLayout()
+
+        if editable:
+            add_session_button = QPushButton("+", self)
+            add_session_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 24px; border-radius: 25px;')
+            add_session_button.clicked.connect(lambda: self.add_session(date))
+            layout.addWidget(add_session_button)
+
+        self.session_layout = QVBoxLayout()
+
+        if date in self.sessions:
+            for session in self.sessions[date]:
+                session_name = f"{session['hall']['name']} - {session['performance']['name']} - {session['time'].toString('HH:mm')} - {session['price']} руб."
+                session_button = QPushButton(session_name, self)
+                session_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
+                session_button.clicked.connect(lambda checked, s=session: self.show_seat_selection_dialog(s))
+                self.session_layout.addWidget(session_button)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_content.setLayout(self.session_layout)
+        scroll_area.setWidget(scroll_content)
+
+        layout.addWidget(scroll_area)
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def show_seat_selection_dialog(self, session):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Выбор мест для сеанса {session['id']}")
+        dialog.setFixedSize(600, 400)
+
+        layout = QVBoxLayout()
+
+        hall = session["hall"]
+        if hall is None:
+            QMessageBox.warning(self, "Ошибка", "Зал для сеанса не выбран.")
+            dialog.reject()
+            return
+
+        seats_layout = QGridLayout()
+        for row in range(hall["rows"]):
+            for seat in range(hall["seats"]):
+                seat_button = QPushButton(f"{row+1}-{seat+1}", self)
+                seat_button.setFixedSize(30, 30)
+                seat_button.setStyleSheet('color: #555555; border: 1px solid #D3D3D3; background-color: #D3D3D3; font-size: 10px;')
+                if (row, seat) in session["seats"]:
+                    seat_button.setStyleSheet('color: #555555; border: 1px solid #D3D3D3; background-color: #FF0000; font-size: 10px;')
+                seat_button.clicked.connect(lambda checked, r=row, s=seat, b=seat_button: self.reserve_seat(session, r, s, b))
+                seats_layout.addWidget(seat_button, row, seat)
+
+        dialog_width = (hall["seats"] * 30) + 40
+        dialog_height = (hall["rows"] * 30) + 80
+        dialog.setFixedSize(dialog_width, dialog_height)
+
+        layout.addLayout(seats_layout)
+
+        save_button = QPushButton("Сохранить", self)
+        save_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
+        save_button.clicked.connect(dialog.accept)
+        layout.addWidget(save_button)
+
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def reserve_seat(self, session, row, seat, seat_button):
+        if (row, seat) in session["seats"]:
+            session["seats"].remove((row, seat))
+            seat_button.setStyleSheet('color: #555555; border: 1px solid #D3D3D3; background-color: #D3D3D3; font-size: 10px;')
+            self.cur.execute("DELETE FROM reserved_seats WHERE session_id = %s AND row = %s AND seat = %s", (session["id"], row, seat))
+            self.conn.commit()
+        else:
+            session["seats"].add((row, seat))
+            seat_button.setStyleSheet('color: #FFFFFF; border: 1px solid #D3D3D3; background-color: #FF0000; font-size: 10px;')
+            self.cur.execute("INSERT INTO reserved_seats (session_id, row, seat) VALUES (%s, %s, %s)", (session["id"], row, seat))
+            self.conn.commit()
 
     def clear_window(self):
         for widget in self.findChildren(QWidget):
             widget.deleteLater()
 
-class HallsTab(QWidget):
-    def __init__(self, main_window):
-        super().__init__()
-        self.main_window = main_window
-        layout = QVBoxLayout()
-
-        add_hall_button = QPushButton("+")
-        add_hall_button.setFont(QFont("Arial", 14))
-        add_hall_button.setStyleSheet("background-color: #28a745; color: white; border-radius: 5px; padding: 10px;")
-        add_hall_button.clicked.connect(lambda: EditHallScreen(self.main_window))
-        layout.addWidget(add_hall_button, alignment=Qt.AlignCenter)
-
-        self.halls_list = QVBoxLayout()
-        layout.addLayout(self.halls_list)
-
-        self.update_halls_list()
-
-        container = QWidget()
-        container.setLayout(layout)
-        self.setLayout(layout)
-
-    def update_halls_list(self):
-        for i in reversed(range(self.halls_list.count())):
-            self.halls_list.itemAt(i).widget().setParent(None)
-        for hall in self.main_window.halls:
-            hall_button = QPushButton(hall['name'])
-            hall_button.setFont(QFont("Arial", 12))
-            hall_button.setStyleSheet("background-color: #ffc107; color: black; border-radius: 5px; padding: 8px;")
-            hall_button.clicked.connect(lambda checked, h=hall: EditHallScreen(self.main_window, h))
-            self.halls_list.addWidget(hall_button)
-
-class ShowsTab(QWidget):
-    def __init__(self, main_window):
-        super().__init__()
-        self.main_window = main_window
-        layout = QVBoxLayout()
-
-        add_show_button = QPushButton("+")
-        add_show_button.setFont(QFont("Arial", 14))
-        add_show_button.setStyleSheet("background-color: #28a745; color: white; border-radius: 5px; padding: 10px;")
-        add_show_button.clicked.connect(lambda: EditShowScreen(self.main_window))
-        layout.addWidget(add_show_button, alignment=Qt.AlignCenter)
-
-        self.shows_list = QVBoxLayout()
-        layout.addLayout(self.shows_list)
-
-        self.update_shows_list()
-
-        container = QWidget()
-        container.setLayout(layout)
-        self.setLayout(layout)
-
-    def update_shows_list(self):
-        for i in reversed(range(self.shows_list.count())):
-            self.shows_list.itemAt(i).widget().setParent(None)
-        for show in self.main_window.shows.values():
-            show_button = QPushButton(show['name'])
-            show_button.setFont(QFont("Arial", 12))
-            show_button.setStyleSheet("background-color: #ffc107; color: black; border-radius: 5px; padding: 8px;")
-            show_button.clicked.connect(lambda checked, s=show: EditShowScreen(self.main_window, s))
-            self.shows_list.addWidget(show_button)
-
-class ScheduleTab(QWidget):
-    def __init__(self, main_window, title, is_next_week):
-        super().__init__()
-        self.main_window = main_window
-        self.is_next_week = is_next_week
-
-        layout = QVBoxLayout()
-
-        label = QLabel(title)
-        label.setFont(QFont("Arial", 16))
-        label.setStyleSheet("color: #333;")
-        layout.addWidget(label, alignment=Qt.AlignCenter)
-
-        self.schedule_list = QVBoxLayout()
-
-        start_date = datetime.now()
-        if is_next_week:
-            start_date += timedelta(weeks=1)
-        start_of_week = start_date - timedelta(days=start_date.weekday())
-
-        for i in range(7):
-            current_date = start_of_week + timedelta(days=i)
-            day_button = QPushButton(f"{days_translation[current_date.strftime('%A')]} {current_date.strftime('%d.%m.%Y')}")
-            day_button.setFont(QFont("Arial", 12))
-            day_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
-            day_button.clicked.connect(lambda checked, d=current_date: AddSessionScreen(main_window, d))
-            self.schedule_list.addWidget(day_button, alignment=Qt.AlignCenter)
-
-            if current_date in self.main_window.sessions:
-                for session in self.main_window.sessions[current_date]:
-                    session_layout = QHBoxLayout()
-                    session_button = QPushButton(f"{session['time']} - {session['show']} - {session['hall']}")
-                    session_button.setFont(QFont("Arial", 12))
-                    session_button.setStyleSheet("background-color: #ffc107; color: black; border-radius: 5px; padding: 8px;")
-                    session_button.clicked.connect(lambda checked, s=session, d=current_date: EditSessionScreen(main_window, d, s))
-                    session_layout.addWidget(session_button)
-
-                    edit_button = QPushButton("Редактировать")
-                    edit_button.setFont(QFont("Arial", 12))
-                    edit_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
-                    edit_button.clicked.connect(lambda checked, s=session, d=current_date: EditSessionScreen(main_window, d, s))
-                    session_layout.addWidget(edit_button)
-
-                    self.schedule_list.addLayout(session_layout)
-
-        layout.addLayout(self.schedule_list)
-
-        self.setLayout(layout)
-
-    def update_sessions_list(self):
-        for i in reversed(range(self.schedule_list.count())):
-            self.schedule_list.itemAt(i).widget().setParent(None)
-
-        start_date = datetime.now()
-        if self.is_next_week:
-            start_date += timedelta(weeks=1)
-        start_of_week = start_date - timedelta(days=start_date.weekday())
-
-        for i in range(7):
-            current_date = start_of_week + timedelta(days=i)
-            day_button = QPushButton(f"{days_translation[current_date.strftime('%A')]} {current_date.strftime('%d.%m.%Y')}")
-            day_button.setFont(QFont("Arial", 12))
-            day_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
-            day_button.clicked.connect(lambda checked, d=current_date: AddSessionScreen(self.main_window, d))
-            self.schedule_list.addWidget(day_button, alignment=Qt.AlignCenter)
-
-            if current_date in self.main_window.sessions:
-                for session in self.main_window.sessions[current_date]:
-                    session_layout = QHBoxLayout()
-                    session_button = QPushButton(f"{session['time']} - {session['show']} - {session['hall']}")
-                    session_button.setFont(QFont("Arial", 12))
-                    session_button.setStyleSheet("background-color: #ffc107; color: black; border-radius: 5px; padding: 8px;")
-                    session_button.clicked.connect(lambda checked, s=session, d=current_date: EditSessionScreen(self.main_window, d, s))
-                    session_layout.addWidget(session_button)
-
-                    edit_button = QPushButton("Редактировать")
-                    edit_button.setFont(QFont("Arial", 12))
-                    edit_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
-                    edit_button.clicked.connect(lambda checked, s=session, d=current_date: EditSessionScreen(self.main_window, d, s))
-                    session_layout.addWidget(edit_button)
-
-                    self.schedule_list.addLayout(session_layout)
-
-class ViewScheduleTab(QWidget):
-    def __init__(self, main_window, title, is_next_week):
-        super().__init__()
-        self.main_window = main_window
-        self.is_next_week = is_next_week
-
-        layout = QVBoxLayout()
-
-        label = QLabel(title)
-        label.setFont(QFont("Arial", 16))
-        label.setStyleSheet("color: #333;")
-        layout.addWidget(label, alignment=Qt.AlignCenter)
-
-        self.schedule_list = QVBoxLayout()
-
-        start_date = datetime.now()
-        if is_next_week:
-            start_date += timedelta(weeks=1)
-        start_of_week = start_date - timedelta(days=start_date.weekday())
-
-        for i in range(7):
-            current_date = start_of_week + timedelta(days=i)
-            day_label = QLabel(f"{days_translation[current_date.strftime('%A')]} {current_date.strftime('%d.%m.%Y')}")
-            day_label.setFont(QFont("Arial", 14))
-            day_label.setStyleSheet("color: #0078d7;")
-            self.schedule_list.addWidget(day_label, alignment=Qt.AlignCenter)
-
-            if current_date in self.main_window.sessions:
-                for session in self.main_window.sessions[current_date]:
-                    session_label = QLabel(f"{session['time']} - {session['show']} - {session['hall']}")
-                    session_label.setFont(QFont("Arial", 12))
-                    session_label.setStyleSheet("color: #333;")
-                    self.schedule_list.addWidget(session_label, alignment=Qt.AlignCenter)
-
-        layout.addLayout(self.schedule_list)
-
-        self.setLayout(layout)
-
-def EditHallScreen(main_window, hall=None):
-    main_window.clear_window()
-
-    layout = QVBoxLayout()
-
-    hall_name_layout = QHBoxLayout()
-    hall_name_label = QLabel("Название зала:")
-    hall_name_label.setFont(QFont("Arial", 12))
-    hall_name_label.setStyleSheet("color: #333;")
-    hall_name_input = QLineEdit()
-    if hall:
-        hall_name_input.setText(hall['name'])
-    hall_name_input.setStyleSheet("padding: 5px; border: 1px solid #ccc; border-radius: 5px;")
-    hall_name_layout.addWidget(hall_name_label)
-    hall_name_layout.addWidget(hall_name_input)
-    layout.addLayout(hall_name_layout)
-
-    rows_table = QTableWidget()
-    rows_table.setColumnCount(2)
-    rows_table.setHorizontalHeaderLabels(["Ряд", "Количество мест"])
-    rows_table.setStyleSheet("border: 1px solid #ccc; padding: 5px;")
-    if hall:
-        rows_table.setRowCount(len(hall['rows']))
-        for row_idx, row in enumerate(hall['rows']):
-            rows_table.setItem(row_idx, 0, QTableWidgetItem(str(row['row_number'])))
-            rows_table.setItem(row_idx, 1, QTableWidgetItem(str(row['seats'])))
-    layout.addWidget(rows_table)
-
-    add_row_layout = QHBoxLayout()
-    row_number_input = QSpinBox()
-    row_number_input.setMinimum(1)
-    row_number_input.setMaximum(100)
-    row_number_input.setStyleSheet("padding: 5px; border: 1px solid #ccc; border-radius: 5px;")
-    seats_input = QSpinBox()
-    seats_input.setMinimum(1)
-    seats_input.setMaximum(500)
-    seats_input.setStyleSheet("padding: 5px; border: 1px solid #ccc; border-radius: 5px;")
-    add_row_button = QPushButton("Добавить ряд")
-    add_row_button.setFont(QFont("Arial", 12))
-    add_row_button.setStyleSheet("background-color: #28a745; color: white; border-radius: 5px; padding: 8px;")
-    add_row_button.clicked.connect(lambda: add_row(rows_table, row_number_input, seats_input))
-    add_row_layout.addWidget(QLabel("Ряд:").setStyleSheet("color: #333;"))
-    add_row_layout.addWidget(row_number_input)
-    add_row_layout.addWidget(QLabel("Мест:").setStyleSheet("color: #333;"))
-    add_row_layout.addWidget(seats_input)
-    add_row_layout.addWidget(add_row_button)
-    layout.addLayout(add_row_layout)
-
-    save_button = QPushButton("Сохранить")
-    save_button.setFont(QFont("Arial", 12))
-    save_button.setStyleSheet("background-color: #28a745; color: white; border-radius: 5px; padding: 8px;")
-    save_button.clicked.connect(lambda: save_hall(main_window, hall, hall_name_input, rows_table))
-    layout.addWidget(save_button, alignment=Qt.AlignCenter)
-
-    back_button = QPushButton("Назад")
-    back_button.setFont(QFont("Arial", 12))
-    back_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
-    back_button.clicked.connect(main_window.open_edit_screen)
-    layout.addWidget(back_button, alignment=Qt.AlignCenter)
-
-    container = QWidget()
-    container.setLayout(layout)
-    main_window.setCentralWidget(container)
-
-def add_row(rows_table, row_number_input, seats_input):
-    row_position = rows_table.rowCount()
-    rows_table.insertRow(row_position)
-    rows_table.setItem(row_position, 0, QTableWidgetItem(str(row_number_input.value())))
-    rows_table.setItem(row_position, 1, QTableWidgetItem(str(seats_input.value())))
-
-def save_hall(main_window, hall, hall_name_input, rows_table):
-    hall_name = hall_name_input.text()
-    rows = []
-    for row in range(rows_table.rowCount()):
-        row_number = int(rows_table.item(row, 0).text())
-        seats = int(rows_table.item(row, 1).text())
-        rows.append({'row_number': row_number, 'seats': seats})
-
-    if hall:
-        hall['name'] = hall_name
-        hall['rows'] = rows
-    else:
-        main_window.halls.append({'name': hall_name, 'rows': rows})
-
-    QMessageBox.information(main_window, "Сохранение", f"Зал {hall_name} сохранен")
-    main_window.open_edit_screen()
-
-def EditShowScreen(main_window, show=None):
-    main_window.clear_window()
-
-    layout = QVBoxLayout()
-
-    show_name_layout = QHBoxLayout()
-    show_name_label = QLabel("Название спектакля:")
-    show_name_label.setFont(QFont("Arial", 12))
-    show_name_label.setStyleSheet("color: #333;")
-    show_name_input = QLineEdit()
-    if show:
-        show_name_input.setText(show['name'])
-    show_name_input.setStyleSheet("padding: 5px; border: 1px solid #ccc; border-radius: 5px;")
-    show_name_layout.addWidget(show_name_label)
-    show_name_layout.addWidget(show_name_input)
-    layout.addLayout(show_name_layout)
-
-    save_button = QPushButton("Сохранить")
-    save_button.setFont(QFont("Arial", 12))
-    save_button.setStyleSheet("background-color: #28a745; color: white; border-radius: 5px; padding: 8px;")
-    save_button.clicked.connect(lambda: save_show(main_window, show, show_name_input))
-    layout.addWidget(save_button, alignment=Qt.AlignCenter)
-
-    back_button = QPushButton("Назад")
-    back_button.setFont(QFont("Arial", 12))
-    back_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
-    back_button.clicked.connect(main_window.open_edit_screen)
-    layout.addWidget(back_button, alignment=Qt.AlignCenter)
-
-    container = QWidget()
-    container.setLayout(layout)
-    main_window.setCentralWidget(container)
-
-def save_show(main_window, show, show_name_input):
-    show_name = show_name_input.text()
-
-    if show:
-        show['name'] = show_name
-    else:
-        show_id = len(main_window.shows) + 1
-        main_window.shows[show_id] = {'name': show_name}
-
-    QMessageBox.information(main_window, "Сохранение", f"Спектакль {show_name} сохранен")
-    main_window.open_edit_screen()
-
-def AddSessionScreen(main_window, date):
-    main_window.clear_window()
-
-    layout = QVBoxLayout()
-
-    label = QLabel(f"Добавление сеанса на {days_translation[date.strftime('%A')]} {date.strftime('%d.%m.%Y')}")
-    label.setFont(QFont("Arial", 16))
-    label.setStyleSheet("color: #333;")
-    layout.addWidget(label, alignment=Qt.AlignCenter)
-
-    add_session_button = QPushButton("+")
-    add_session_button.setFont(QFont("Arial", 14))
-    add_session_button.setStyleSheet("background-color: #28a745; color: white; border-radius: 5px; padding: 10px;")
-    add_session_button.clicked.connect(lambda: EditSessionScreen(main_window, date))
-    layout.addWidget(add_session_button, alignment=Qt.AlignCenter)
-
-    sessions_list = QVBoxLayout()
-    layout.addLayout(sessions_list)
-
-    update_sessions_list(main_window, date, sessions_list)
-
-    back_button = QPushButton("Назад")
-    back_button.setFont(QFont("Arial", 12))
-    back_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
-    back_button.clicked.connect(lambda: main_window.open_edit_screen())
-    layout.addWidget(back_button, alignment=Qt.AlignCenter)
-
-    container = QWidget()
-    container.setLayout(layout)
-    main_window.setCentralWidget(container)
-
-def update_sessions_list(main_window, date, sessions_list):
-    for i in reversed(range(sessions_list.count())):
-        sessions_list.itemAt(i).widget().setParent(None)
-    if date in main_window.sessions:
-        for session in main_window.sessions[date]:
-            session_button = QPushButton(f"{session['time']} - {session['show']} - {session['hall']}")
-            session_button.setFont(QFont("Arial", 12))
-            session_button.setStyleSheet("background-color: #ffc107; color: black; border-radius: 5px; padding: 8px;")
-            session_button.clicked.connect(lambda checked, s=session: EditSessionScreen(main_window, date, s))
-            sessions_list.addWidget(session_button)
-
-def EditSessionScreen(main_window, date, session=None):
-    main_window.clear_window()
-
-    layout = QVBoxLayout()
-
-    time_layout = QHBoxLayout()
-    time_label = QLabel("Время:")
-    time_label.setFont(QFont("Arial", 12))
-    time_label.setStyleSheet("color: #333;")
-    time_edit = QTimeEdit()
-    if session:
-        time_edit.setTime(QTime.fromString(session['time'], "hh:mm"))
-    time_edit.setStyleSheet("padding: 5px; border: 1px solid #ccc; border-radius: 5px;")
-    time_layout.addWidget(time_label)
-    time_layout.addWidget(time_edit)
-    layout.addLayout(time_layout)
-
-    show_layout = QHBoxLayout()
-    show_label = QLabel("Спектакль:")
-    show_label.setFont(QFont("Arial", 12))
-    show_label.setStyleSheet("color: #333;")
-    show_combo = QComboBox()
-    for show in main_window.shows.values():
-        show_combo.addItem(show['name'])
-    if session:
-        show_combo.setCurrentText(session['show'])
-    show_combo.setStyleSheet("padding: 5px; border: 1px solid #ccc; border-radius: 5px;")
-    show_layout.addWidget(show_label)
-    show_layout.addWidget(show_combo)
-    layout.addLayout(show_layout)
-
-    hall_layout = QHBoxLayout()
-    hall_label = QLabel("Зал:")
-    hall_label.setFont(QFont("Arial", 12))
-    hall_label.setStyleSheet("color: #333;")
-    hall_combo = QComboBox()
-    for hall in main_window.halls:
-        hall_combo.addItem(hall['name'])
-    if session:
-        hall_combo.setCurrentText(session['hall'])
-    hall_combo.setStyleSheet("padding: 5px; border: 1px solid #ccc; border-radius: 5px;")
-    hall_layout.addWidget(hall_label)
-    hall_layout.addWidget(hall_combo)
-    layout.addLayout(hall_layout)
-
-    price_layout = QHBoxLayout()
-    price_label = QLabel("Цена:")
-    price_label.setFont(QFont("Arial", 12))
-    price_label.setStyleSheet("color: #333;")
-    price_spin = QSpinBox()
-    price_spin.setMinimum(0)
-    price_spin.setMaximum(10000)
-    if session:
-        price_spin.setValue(session['price'])
-    price_spin.setStyleSheet("padding: 5px; border: 1px solid #ccc; border-radius: 5px;")
-    price_layout.addWidget(price_label)
-    price_layout.addWidget(price_spin)
-    layout.addLayout(price_layout)
-
-    save_button = QPushButton("Сохранить")
-    save_button.setFont(QFont("Arial", 12))
-    save_button.setStyleSheet("background-color: #28a745; color: white; border-radius: 5px; padding: 8px;")
-    save_button.clicked.connect(lambda: save_session(main_window, date, session, time_edit, show_combo, hall_combo, price_spin))
-    layout.addWidget(save_button, alignment=Qt.AlignCenter)
-
-    back_button = QPushButton("Назад")
-    back_button.setFont(QFont("Arial", 12))
-    back_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
-    back_button.clicked.connect(lambda: AddSessionScreen(main_window, date))
-    layout.addWidget(back_button, alignment=Qt.AlignCenter)
-
-    container = QWidget()
-    container.setLayout(layout)
-    main_window.setCentralWidget(container)
-
-
-def save_session(main_window, date, session, time_edit, show_combo, hall_combo, price_spin):
-    session_time = time_edit.time().toString("hh:mm")
-    session_show = show_combo.currentText()
-    session_hall = hall_combo.currentText()
-    session_price = price_spin.value()
-
-    session_data = {
-        'time': session_time,
-        'show': session_show,
-        'hall': session_hall,
-        'price': session_price
-    }
-
-    if session:
-        if date in main_window.sessions:
-            for i, s in enumerate(main_window.sessions[date]):
-                if s == session:
-                    main_window.sessions[date][i] = session_data
-                    break
-    else:
-        if date not in main_window.sessions:
-            main_window.sessions[date] = []
-        main_window.sessions[date].append(session_data)
-
-    save_sessions_to_file(main_window.sessions)  # Сохраняем сеансы на диск
-
-    QMessageBox.information(main_window, "Сохранение",
-                            f"Сеанс {session_time}, {session_show}, {session_hall}, {session_price} сохранен")
-
-    if main_window.current_week_tab:
-        main_window.current_week_tab.update_sessions_list()
-    if main_window.next_week_tab:
-        main_window.next_week_tab.update_sessions_list()
-
-    AddSessionScreen(main_window, date)
-
-def save_sessions_to_file(sessions, filename='sessions.json'):
-    # Преобразуем ключи datetime в строки
-    sessions_str_keys = {date.strftime('%Y-%m-%d'): sessions[date] for date in sessions}
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(sessions_str_keys, f, ensure_ascii=False, indent=4)
-    print(f"Сеансы сохранены в файл: {sessions_str_keys}")
-
-def load_sessions_from_file(filename='sessions.json'):
-    if not Path(filename).exists():
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump({}, f, ensure_ascii=False, indent=4)
-    try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            sessions_str_keys = json.load(f)
-            # Преобразуем ключи строки обратно в datetime
-            sessions = {datetime.strptime(date_str, '%Y-%m-%d'): sessions_str_keys[date_str] for date_str in sessions_str_keys}
-            print(f"Сеансы загружены из файла: {sessions}")
-            return sessions
-    except json.JSONDecodeError as e:
-        print(f"Ошибка при загрузке файла {filename}: {e}")
-        return {}
-
-def load_sessions_from_file(filename='sessions.json'):
-    if not Path(filename).exists():
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump({}, f, ensure_ascii=False, indent=4)
-    try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            sessions_str_keys = json.load(f)
-            # Преобразуем ключи строки обратно в datetime
-            sessions = {datetime.strptime(date_str, '%Y-%m-%d'): sessions_str_keys[date_str] for date_str in sessions_str_keys}
-            return sessions
-    except json.JSONDecodeError as e:
-        print(f"Ошибка при загрузке файла {filename}: {e}")
-        return {}
+    def create_label(self, text, sx, sy, x, y, size, color, weight):
+        label = QLabel(text, self)
+        label.setGeometry(sx, sy, x, y)
+        label.setStyleSheet(
+            f'color: {color}; font-size: {size}px; background-color: rgba(255,255,255,0); font-weight: {weight}')
+        label.show()
+
+    def create_button(self, text, sx, sy, x, y, color, action, inv_cal=False):
+        button = QPushButton(text, self)
+        button.setGeometry(sx, sy, x, y)
+        text_color = '#555555' if not inv_cal else color
+        bg_color = color if not inv_cal else 'white'
+        border_color = color if not inv_cal else 'white'
+        button.setStyleSheet(
+            f'color: {text_color}; border: 3px solid {border_color}; background-color: {bg_color}; font-size: 20px; border-radius: 30px;')
+        button.clicked.connect(action)
+        button.show()
 
 if __name__ == "__main__":
-    main()
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
