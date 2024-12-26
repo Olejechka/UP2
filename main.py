@@ -2,11 +2,24 @@ import sys
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QLabel,
                              QVBoxLayout, QHBoxLayout, QTabWidget,
                              QLineEdit, QTableWidget, QTableWidgetItem, QSpinBox,
-                             QComboBox, QGridLayout, QCheckBox, QDialog, QMessageBox,
-                             QDateEdit, QTimeEdit, QFrame, QScrollArea, QWidget)
-from PyQt5.QtCore import Qt, QDate, QTime
-from PyQt5.QtGui import QFont, QColor
+                             QComboBox, QMessageBox,
+                             QTimeEdit, QWidget)
+from PyQt5.QtCore import Qt, QTime
+from PyQt5.QtGui import QFont
 from datetime import datetime, timedelta
+import json
+from pathlib import Path
+
+# Словарь для перевода дней недели на русский
+days_translation = {
+    "Monday": "Понедельник",
+    "Tuesday": "Вторник",
+    "Wednesday": "Среда",
+    "Thursday": "Четверг",
+    "Friday": "Пятница",
+    "Saturday": "Суббота",
+    "Sunday": "Воскресенье"
+}
 
 def main():
     app = QApplication(sys.argv)
@@ -25,7 +38,7 @@ class MainWindow(QMainWindow):
         # Данные
         self.halls = []
         self.shows = {}
-        self.sessions = {}
+        self.sessions = load_sessions_from_file()
 
         self.main_screen()
         self.current_week_tab = None
@@ -39,7 +52,7 @@ class MainWindow(QMainWindow):
         sessions_button = QPushButton("Перейти к сеансам")
         sessions_button.setFont(QFont("Arial", 14))
         sessions_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 10px;")
-        sessions_button.clicked.connect(self.open_sessions_screen)
+        sessions_button.clicked.connect(self.open_view_schedule_screen)
         layout.addWidget(sessions_button, alignment=Qt.AlignCenter)
 
         edit_button = QPushButton("Редактировать")
@@ -52,7 +65,7 @@ class MainWindow(QMainWindow):
         container.setLayout(layout)
         self.setCentralWidget(container)
 
-    def open_sessions_screen(self):
+    def open_view_schedule_screen(self):
         self.clear_window()
 
         layout = QVBoxLayout()
@@ -67,13 +80,14 @@ class MainWindow(QMainWindow):
         back_button.clicked.connect(self.main_screen)
         layout.addWidget(back_button, alignment=Qt.AlignCenter)
 
-        self.current_week_tab = ScheduleTab(self, "На тек. неделю", is_next_week=False)
-        self.next_week_tab = ScheduleTab(self, "На след. неделю", is_next_week=True)
+        self.current_week_tab = ViewScheduleTab(self, "На тек. неделю", is_next_week=False)
+        self.next_week_tab = ViewScheduleTab(self, "На след. неделю", is_next_week=True)
 
         tabs = QTabWidget()
         tabs.addTab(self.current_week_tab, "На тек. неделю")
         tabs.addTab(self.next_week_tab, "На след. неделю")
-        tabs.setStyleSheet("QTabWidget::pane { border: 1px solid #ccc; } QTabBar::tab { background: #0078d7; color: white; padding: 8px; border-radius: 5px; } QTabBar::tab:selected { background: #005bb5; }")
+        tabs.setStyleSheet(
+            "QTabWidget::pane { border: 1px solid #ccc; } QTabBar::tab { background: #0078d7; color: white; padding: 8px; border-radius: 5px; } QTabBar::tab:selected { background: #005bb5; }")
         layout.addWidget(tabs)
 
         container = QWidget()
@@ -95,6 +109,24 @@ class MainWindow(QMainWindow):
         back_button.clicked.connect(self.main_screen)
         layout.addWidget(back_button, alignment=Qt.AlignCenter)
 
+        tabs = QTabWidget()
+        tabs.setStyleSheet(
+            "QTabWidget::pane { border: 1px solid #ccc; } QTabBar::tab { background: #0078d7; color: white; padding: 8px; border-radius: 5px; } QTabBar::tab:selected { background: #005bb5; }")
+
+        halls_tab = HallsTab(self)
+        tabs.addTab(halls_tab, "Залы")
+
+        shows_tab = ShowsTab(self)
+        tabs.addTab(shows_tab, "Спектакли")
+
+        current_week_tab = ScheduleTab(self, "На тек. неделю", is_next_week=False)
+        tabs.addTab(current_week_tab, "На тек. неделю")
+
+        next_week_tab = ScheduleTab(self, "На след. неделю", is_next_week=True)
+        tabs.addTab(next_week_tab, "На след. неделю")
+
+        layout.addWidget(tabs)
+
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
@@ -103,6 +135,16 @@ class MainWindow(QMainWindow):
         self.clear_window()
 
         layout = QVBoxLayout()
+        label = QLabel("Экран запросов")
+        label.setFont(QFont("Arial", 16))
+        label.setStyleSheet("color: #333;")
+        layout.addWidget(label, alignment=Qt.AlignCenter)
+
+        back_button = QPushButton("Назад")
+        back_button.setFont(QFont("Arial", 12))
+        back_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
+        back_button.clicked.connect(self.main_screen)
+        layout.addWidget(back_button, alignment=Qt.AlignCenter)
 
         tabs = QTabWidget()
         tabs.setStyleSheet("QTabWidget::pane { border: 1px solid #ccc; } QTabBar::tab { background: #0078d7; color: white; padding: 8px; border-radius: 5px; } QTabBar::tab:selected { background: #005bb5; }")
@@ -120,12 +162,6 @@ class MainWindow(QMainWindow):
         tabs.addTab(next_week_tab, "На след. неделю")
 
         layout.addWidget(tabs)
-
-        back_button = QPushButton("Назад")
-        back_button.setFont(QFont("Arial", 12))
-        back_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
-        back_button.clicked.connect(self.main_screen)
-        layout.addWidget(back_button, alignment=Qt.AlignCenter)
 
         container = QWidget()
         container.setLayout(layout)
@@ -219,27 +255,34 @@ class ScheduleTab(QWidget):
 
         for i in range(7):
             current_date = start_of_week + timedelta(days=i)
-            day_button = QPushButton(f"{current_date.strftime('%A')} {current_date.strftime('%d.%m.%Y')}")
+            day_button = QPushButton(f"{days_translation[current_date.strftime('%A')]} {current_date.strftime('%d.%m.%Y')}")
             day_button.setFont(QFont("Arial", 12))
             day_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
             day_button.clicked.connect(lambda checked, d=current_date: AddSessionScreen(main_window, d))
             self.schedule_list.addWidget(day_button, alignment=Qt.AlignCenter)
 
-            # Добавляем кнопки для существующих сеансов
             if current_date in self.main_window.sessions:
                 for session in self.main_window.sessions[current_date]:
+                    session_layout = QHBoxLayout()
                     session_button = QPushButton(f"{session['time']} - {session['show']} - {session['hall']}")
                     session_button.setFont(QFont("Arial", 12))
                     session_button.setStyleSheet("background-color: #ffc107; color: black; border-radius: 5px; padding: 8px;")
                     session_button.clicked.connect(lambda checked, s=session, d=current_date: EditSessionScreen(main_window, d, s))
-                    self.schedule_list.addWidget(session_button)
+                    session_layout.addWidget(session_button)
+
+                    edit_button = QPushButton("Редактировать")
+                    edit_button.setFont(QFont("Arial", 12))
+                    edit_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
+                    edit_button.clicked.connect(lambda checked, s=session, d=current_date: EditSessionScreen(main_window, d, s))
+                    session_layout.addWidget(edit_button)
+
+                    self.schedule_list.addLayout(session_layout)
 
         layout.addLayout(self.schedule_list)
 
         self.setLayout(layout)
 
     def update_sessions_list(self):
-        # Очищаем текущий список сеансов
         for i in reversed(range(self.schedule_list.count())):
             self.schedule_list.itemAt(i).widget().setParent(None)
 
@@ -250,27 +293,72 @@ class ScheduleTab(QWidget):
 
         for i in range(7):
             current_date = start_of_week + timedelta(days=i)
-            day_button = QPushButton(f"{current_date.strftime('%A')} {current_date.strftime('%d.%m.%Y')}")
+            day_button = QPushButton(f"{days_translation[current_date.strftime('%A')]} {current_date.strftime('%d.%m.%Y')}")
             day_button.setFont(QFont("Arial", 12))
             day_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
             day_button.clicked.connect(lambda checked, d=current_date: AddSessionScreen(self.main_window, d))
             self.schedule_list.addWidget(day_button, alignment=Qt.AlignCenter)
 
-            # Добавляем кнопки для существующих сеансов
             if current_date in self.main_window.sessions:
                 for session in self.main_window.sessions[current_date]:
+                    session_layout = QHBoxLayout()
                     session_button = QPushButton(f"{session['time']} - {session['show']} - {session['hall']}")
                     session_button.setFont(QFont("Arial", 12))
                     session_button.setStyleSheet("background-color: #ffc107; color: black; border-radius: 5px; padding: 8px;")
                     session_button.clicked.connect(lambda checked, s=session, d=current_date: EditSessionScreen(self.main_window, d, s))
-                    self.schedule_list.addWidget(session_button)
+                    session_layout.addWidget(session_button)
+
+                    edit_button = QPushButton("Редактировать")
+                    edit_button.setFont(QFont("Arial", 12))
+                    edit_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
+                    edit_button.clicked.connect(lambda checked, s=session, d=current_date: EditSessionScreen(self.main_window, d, s))
+                    session_layout.addWidget(edit_button)
+
+                    self.schedule_list.addLayout(session_layout)
+
+class ViewScheduleTab(QWidget):
+    def __init__(self, main_window, title, is_next_week):
+        super().__init__()
+        self.main_window = main_window
+        self.is_next_week = is_next_week
+
+        layout = QVBoxLayout()
+
+        label = QLabel(title)
+        label.setFont(QFont("Arial", 16))
+        label.setStyleSheet("color: #333;")
+        layout.addWidget(label, alignment=Qt.AlignCenter)
+
+        self.schedule_list = QVBoxLayout()
+
+        start_date = datetime.now()
+        if is_next_week:
+            start_date += timedelta(weeks=1)
+        start_of_week = start_date - timedelta(days=start_date.weekday())
+
+        for i in range(7):
+            current_date = start_of_week + timedelta(days=i)
+            day_label = QLabel(f"{days_translation[current_date.strftime('%A')]} {current_date.strftime('%d.%m.%Y')}")
+            day_label.setFont(QFont("Arial", 14))
+            day_label.setStyleSheet("color: #0078d7;")
+            self.schedule_list.addWidget(day_label, alignment=Qt.AlignCenter)
+
+            if current_date in self.main_window.sessions:
+                for session in self.main_window.sessions[current_date]:
+                    session_label = QLabel(f"{session['time']} - {session['show']} - {session['hall']}")
+                    session_label.setFont(QFont("Arial", 12))
+                    session_label.setStyleSheet("color: #333;")
+                    self.schedule_list.addWidget(session_label, alignment=Qt.AlignCenter)
+
+        layout.addLayout(self.schedule_list)
+
+        self.setLayout(layout)
 
 def EditHallScreen(main_window, hall=None):
     main_window.clear_window()
 
     layout = QVBoxLayout()
 
-    # Название зала
     hall_name_layout = QHBoxLayout()
     hall_name_label = QLabel("Название зала:")
     hall_name_label.setFont(QFont("Arial", 12))
@@ -283,20 +371,17 @@ def EditHallScreen(main_window, hall=None):
     hall_name_layout.addWidget(hall_name_input)
     layout.addLayout(hall_name_layout)
 
-    # Таблица для рядов и мест
     rows_table = QTableWidget()
     rows_table.setColumnCount(2)
     rows_table.setHorizontalHeaderLabels(["Ряд", "Количество мест"])
     rows_table.setStyleSheet("border: 1px solid #ccc; padding: 5px;")
     if hall:
-        for row in hall['rows']:
-            row_position = rows_table.rowCount()
-            rows_table.insertRow(row_position)
-            rows_table.setItem(row_position, 0, QTableWidgetItem(str(row['row_number'])))
-            rows_table.setItem(row_position, 1, QTableWidgetItem(str(row['seats'])))
+        rows_table.setRowCount(len(hall['rows']))
+        for row_idx, row in enumerate(hall['rows']):
+            rows_table.setItem(row_idx, 0, QTableWidgetItem(str(row['row_number'])))
+            rows_table.setItem(row_idx, 1, QTableWidgetItem(str(row['seats'])))
     layout.addWidget(rows_table)
 
-    # Добавление ряда
     add_row_layout = QHBoxLayout()
     row_number_input = QSpinBox()
     row_number_input.setMinimum(1)
@@ -317,14 +402,12 @@ def EditHallScreen(main_window, hall=None):
     add_row_layout.addWidget(add_row_button)
     layout.addLayout(add_row_layout)
 
-    # Кнопка сохранения
     save_button = QPushButton("Сохранить")
     save_button.setFont(QFont("Arial", 12))
     save_button.setStyleSheet("background-color: #28a745; color: white; border-radius: 5px; padding: 8px;")
     save_button.clicked.connect(lambda: save_hall(main_window, hall, hall_name_input, rows_table))
     layout.addWidget(save_button, alignment=Qt.AlignCenter)
 
-    # Кнопка назад
     back_button = QPushButton("Назад")
     back_button.setFont(QFont("Arial", 12))
     back_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
@@ -363,7 +446,6 @@ def EditShowScreen(main_window, show=None):
 
     layout = QVBoxLayout()
 
-    # Название спектакля
     show_name_layout = QHBoxLayout()
     show_name_label = QLabel("Название спектакля:")
     show_name_label.setFont(QFont("Arial", 12))
@@ -376,14 +458,12 @@ def EditShowScreen(main_window, show=None):
     show_name_layout.addWidget(show_name_input)
     layout.addLayout(show_name_layout)
 
-    # Кнопка сохранения
     save_button = QPushButton("Сохранить")
     save_button.setFont(QFont("Arial", 12))
     save_button.setStyleSheet("background-color: #28a745; color: white; border-radius: 5px; padding: 8px;")
     save_button.clicked.connect(lambda: save_show(main_window, show, show_name_input))
     layout.addWidget(save_button, alignment=Qt.AlignCenter)
 
-    # Кнопка назад
     back_button = QPushButton("Назад")
     back_button.setFont(QFont("Arial", 12))
     back_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
@@ -411,7 +491,7 @@ def AddSessionScreen(main_window, date):
 
     layout = QVBoxLayout()
 
-    label = QLabel(f"Добавление сеанса на {date.strftime('%A %d.%m.%Y')}")
+    label = QLabel(f"Добавление сеанса на {days_translation[date.strftime('%A')]} {date.strftime('%d.%m.%Y')}")
     label.setFont(QFont("Arial", 16))
     label.setStyleSheet("color: #333;")
     layout.addWidget(label, alignment=Qt.AlignCenter)
@@ -427,11 +507,10 @@ def AddSessionScreen(main_window, date):
 
     update_sessions_list(main_window, date, sessions_list)
 
-    # Кнопка назад
     back_button = QPushButton("Назад")
     back_button.setFont(QFont("Arial", 12))
     back_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
-    back_button.clicked.connect(lambda: main_window.open_sessions_screen())
+    back_button.clicked.connect(lambda: main_window.open_edit_screen())
     layout.addWidget(back_button, alignment=Qt.AlignCenter)
 
     container = QWidget()
@@ -454,7 +533,6 @@ def EditSessionScreen(main_window, date, session=None):
 
     layout = QVBoxLayout()
 
-    # Время сеанса
     time_layout = QHBoxLayout()
     time_label = QLabel("Время:")
     time_label.setFont(QFont("Arial", 12))
@@ -467,7 +545,6 @@ def EditSessionScreen(main_window, date, session=None):
     time_layout.addWidget(time_edit)
     layout.addLayout(time_layout)
 
-    # Спектакль
     show_layout = QHBoxLayout()
     show_label = QLabel("Спектакль:")
     show_label.setFont(QFont("Arial", 12))
@@ -482,7 +559,6 @@ def EditSessionScreen(main_window, date, session=None):
     show_layout.addWidget(show_combo)
     layout.addLayout(show_layout)
 
-    # Зал
     hall_layout = QHBoxLayout()
     hall_label = QLabel("Зал:")
     hall_label.setFont(QFont("Arial", 12))
@@ -497,7 +573,6 @@ def EditSessionScreen(main_window, date, session=None):
     hall_layout.addWidget(hall_combo)
     layout.addLayout(hall_layout)
 
-    # Цена
     price_layout = QHBoxLayout()
     price_label = QLabel("Цена:")
     price_label.setFont(QFont("Arial", 12))
@@ -512,14 +587,12 @@ def EditSessionScreen(main_window, date, session=None):
     price_layout.addWidget(price_spin)
     layout.addLayout(price_layout)
 
-    # Кнопка сохранения
     save_button = QPushButton("Сохранить")
     save_button.setFont(QFont("Arial", 12))
     save_button.setStyleSheet("background-color: #28a745; color: white; border-radius: 5px; padding: 8px;")
     save_button.clicked.connect(lambda: save_session(main_window, date, session, time_edit, show_combo, hall_combo, price_spin))
     layout.addWidget(save_button, alignment=Qt.AlignCenter)
 
-    # Кнопка назад
     back_button = QPushButton("Назад")
     back_button.setFont(QFont("Arial", 12))
     back_button.setStyleSheet("background-color: #0078d7; color: white; border-radius: 5px; padding: 8px;")
@@ -529,6 +602,7 @@ def EditSessionScreen(main_window, date, session=None):
     container = QWidget()
     container.setLayout(layout)
     main_window.setCentralWidget(container)
+
 
 def save_session(main_window, date, session, time_edit, show_combo, hall_combo, price_spin):
     session_time = time_edit.time().toString("hh:mm")
@@ -544,27 +618,63 @@ def save_session(main_window, date, session, time_edit, show_combo, hall_combo, 
     }
 
     if session:
-        # Обновляем существующий сеанс
         if date in main_window.sessions:
             for i, s in enumerate(main_window.sessions[date]):
                 if s == session:
                     main_window.sessions[date][i] = session_data
                     break
     else:
-        # Добавляем новый сеанс
         if date not in main_window.sessions:
             main_window.sessions[date] = []
         main_window.sessions[date].append(session_data)
 
-    QMessageBox.information(main_window, "Сохранение", f"Сеанс {session_time}, {session_show}, {session_hall}, {session_price} сохранен")
+    save_sessions_to_file(main_window.sessions)  # Сохраняем сеансы на диск
 
-    # Обновляем списки сеансов, если табы существуют
+    QMessageBox.information(main_window, "Сохранение",
+                            f"Сеанс {session_time}, {session_show}, {session_hall}, {session_price} сохранен")
+
     if main_window.current_week_tab:
         main_window.current_week_tab.update_sessions_list()
     if main_window.next_week_tab:
         main_window.next_week_tab.update_sessions_list()
 
     AddSessionScreen(main_window, date)
+
+def save_sessions_to_file(sessions, filename='sessions.json'):
+    # Преобразуем ключи datetime в строки
+    sessions_str_keys = {date.strftime('%Y-%m-%d'): sessions[date] for date in sessions}
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(sessions_str_keys, f, ensure_ascii=False, indent=4)
+    print(f"Сеансы сохранены в файл: {sessions_str_keys}")
+
+def load_sessions_from_file(filename='sessions.json'):
+    if not Path(filename).exists():
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump({}, f, ensure_ascii=False, indent=4)
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            sessions_str_keys = json.load(f)
+            # Преобразуем ключи строки обратно в datetime
+            sessions = {datetime.strptime(date_str, '%Y-%m-%d'): sessions_str_keys[date_str] for date_str in sessions_str_keys}
+            print(f"Сеансы загружены из файла: {sessions}")
+            return sessions
+    except json.JSONDecodeError as e:
+        print(f"Ошибка при загрузке файла {filename}: {e}")
+        return {}
+
+def load_sessions_from_file(filename='sessions.json'):
+    if not Path(filename).exists():
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump({}, f, ensure_ascii=False, indent=4)
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            sessions_str_keys = json.load(f)
+            # Преобразуем ключи строки обратно в datetime
+            sessions = {datetime.strptime(date_str, '%Y-%m-%d'): sessions_str_keys[date_str] for date_str in sessions_str_keys}
+            return sessions
+    except json.JSONDecodeError as e:
+        print(f"Ошибка при загрузке файла {filename}: {e}")
+        return {}
 
 if __name__ == "__main__":
     main()
