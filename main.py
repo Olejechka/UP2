@@ -13,7 +13,7 @@ class MainWindow(QMainWindow):
         self.setFixedSize(800, 600)  # Запрещаем изменение размера окна
 
         self.conn = psycopg2.connect(
-            dbname="theater",
+            dbname="theatre",
             user="postgres",
             password="2408",
             host="localhost",
@@ -25,6 +25,9 @@ class MainWindow(QMainWindow):
         self.performances = self.load_performances()
         self.sessions = self.load_sessions()
         self.hall_types = self.load_hall_types()
+        self.hall_buttons = {}  # Инициализация словаря для хранения кнопок залов
+        self.performance_buttons = {}  # Инициализация словаря для хранения кнопок спектаклей
+        self.session_buttons = {}  # Инициализация словаря для хранения кнопок сеансов
         self.show_main_menu()
 
     def load_halls(self):
@@ -117,7 +120,9 @@ class MainWindow(QMainWindow):
 
         hall = self.halls[0] if self.halls else None
         performance = self.performances[0] if self.performances else None
-        self.cur.execute("INSERT INTO sessions (date, hall_id, performance_id, time, price) VALUES (%s, %s, %s, %s, %s) RETURNING id", (date, hall["id"], performance["id"], QTime(19, 00), 350))
+        date_str = date.toString('yyyy-MM-dd')  # Преобразуем QDate в строку формата YYYY-MM-DD
+        time_str = QTime(19, 00).toString('HH:mm:ss')  # Преобразуем QTime в строку формата HH:MM:SS
+        self.cur.execute("INSERT INTO sessions (date, hall_id, performance_id, time, price) VALUES (%s, %s, %s, %s, %s) RETURNING id", (date_str, hall["id"], performance["id"], time_str, 350))
         session_id = self.cur.fetchone()[0]
         self.conn.commit()
         session = {
@@ -139,7 +144,8 @@ class MainWindow(QMainWindow):
         session["performance"] = self.performances[performance_combo.currentIndex()]
         session["time"] = time_edit.time()
         session["price"] = float(price_edit.text()) if price_edit.text() else 350
-        self.cur.execute("UPDATE sessions SET hall_id = %s, performance_id = %s, time = %s, price = %s WHERE id = %s", (session["hall"]["id"], session["performance"]["id"], session["time"], session["price"], session["id"]))
+        time_str = session["time"].toString('HH:mm:ss')  # Преобразуем QTime в строку формата HH:MM:SS
+        self.cur.execute("UPDATE sessions SET hall_id = %s, performance_id = %s, time = %s, price = %s WHERE id = %s", (session["hall"]["id"], session["performance"]["id"], time_str, session["price"], session["id"]))
         self.conn.commit()
 
         session_name = f"{session['hall']['name']} - {session['performance']['name']} - {session['time'].toString('HH:mm')}"
@@ -347,84 +353,33 @@ class MainWindow(QMainWindow):
         self.performance_layout.addWidget(performance_button)
         self.performance_buttons[performance["id"]] = performance_button
 
-    def edit_hall(self, hall):
+    def edit_performance(self, performance):
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"Редактирование зала {hall['name']}")
+        dialog.setWindowTitle(f"Редактирование спектакля {performance['name']}")
         dialog.setGeometry(100, 100, 400, 300)
         dialog.setFixedSize(400, 300)
 
         layout = QVBoxLayout()
 
-        name_label = QLabel("Название зала:", self)
+        name_label = QLabel("Название спектакля:", self)
         name_label.setStyleSheet('font-size: 16px;')
         layout.addWidget(name_label)
 
-        name_edit = QLineEdit(hall["name"], self)
+        name_edit = QLineEdit(performance["name"], self)
         layout.addWidget(name_edit)
 
-        type_label = QLabel("Тип зала:", self)
-        type_label.setStyleSheet('font-size: 16px;')
-        layout.addWidget(type_label)
-
-        type_combo = QComboBox(self)
-        for hall_type in self.hall_types:
-            type_combo.addItem(hall_type["description"])
-        type_combo.currentIndexChanged.connect(lambda: self.update_hall_size(hall, type_combo, size_label))
-        layout.addWidget(type_combo)
-
-        size_label = QLabel("", self)
-        size_label.setStyleSheet('font-size: 16px;')
-        layout.addWidget(size_label)
-
-        type_combo.setCurrentIndex(
-            next(i for i, hall_type in enumerate(self.hall_types) if hall_type["id"] == hall["type"]))
-        self.update_hall_size(hall, type_combo, size_label)
-
         save_button = QPushButton("Сохранить", self)
-        save_button.setStyleSheet(
-            'color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
-        save_button.clicked.connect(lambda: self.save_hall_changes(hall, name_edit, type_combo, dialog, size_label))
+        save_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
+        save_button.clicked.connect(lambda: self.save_performance_changes(performance, name_edit, dialog))
         layout.addWidget(save_button)
 
         delete_button = QPushButton("Удалить", self)
-        delete_button.setStyleSheet(
-            'color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
-        delete_button.clicked.connect(lambda: self.delete_hall(hall, dialog))
+        delete_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
+        delete_button.clicked.connect(lambda: self.delete_performance(performance, dialog))
         layout.addWidget(delete_button)
 
         dialog.setLayout(layout)
         dialog.exec_()
-
-    def add_session(self, date):
-        if not self.halls:
-            QMessageBox.warning(self, "Ошибка", "Нет доступных залов. Пожалуйста, добавьте хотя бы один зал.")
-            return
-
-        if not self.performances:
-            QMessageBox.warning(self, "Ошибка",
-                                "Нет доступных спектаклей. Пожалуйста, добавьте хотя бы один спектакль.")
-            return
-
-        hall = self.halls[0] if self.halls else None
-        performance = self.performances[0] if self.performances else None
-        self.cur.execute(
-            "INSERT INTO sessions (date, hall_id, performance_id, time, price) VALUES (%s, %s, %s, %s, %s) RETURNING id",
-            (date, hall["id"], performance["id"], QTime(19, 00), 350))
-        session_id = self.cur.fetchone()[0]
-        self.conn.commit()
-        session = {
-            "id": session_id,
-            "date": date,
-            "hall": hall,
-            "performance": performance,
-            "time": QTime(19, 00),
-            "price": 350,
-            "seats": set()
-        }
-        if date not in self.sessions:
-            self.sessions[date] = []
-        self.sessions[date].append(session)
-        self.create_session_button(session)
 
     def create_session_button(self, session):
         if session["hall"] and session["performance"] and session["time"]:
@@ -495,29 +450,6 @@ class MainWindow(QMainWindow):
 
         dialog.setLayout(layout)
         dialog.exec_()
-
-    def save_session_changes(self, session, hall_combo, performance_combo, time_edit, price_edit, dialog):
-        session["hall"] = self.halls[hall_combo.currentIndex()]
-        session["performance"] = self.performances[performance_combo.currentIndex()]
-        session["time"] = time_edit.time()
-        session["price"] = float(price_edit.text()) if price_edit.text() else 350
-
-        session_name = f"{session['hall']['name']} - {session['performance']['name']} - {session['time'].toString('HH:mm')}"
-        self.cur.execute("UPDATE sessions SET hall_id = %s, performance_id = %s, time = %s, price = %s WHERE id = %s", (session["hall"]["id"], session["performance"]["id"], session["time"], session["price"], session["id"]))
-        self.conn.commit()
-
-        self.session_buttons[session["id"]].setText(session_name)
-        dialog.accept()
-
-    def delete_session(self, session, dialog):
-        reply = QMessageBox.question(self, 'Удаление сеанса', f"Вы уверены, что хотите удалить сеанс {session['id']}?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            self.cur.execute("DELETE FROM sessions WHERE id = %s", (session["id"],))
-            self.conn.commit()
-            self.sessions[session["date"]].remove(session)
-            self.session_buttons[session["id"]].deleteLater()
-            del self.session_buttons[session["id"]]
-            dialog.accept()
 
     def create_current_week_tab(self, editable=True):
         tab = QWidget()
@@ -627,18 +559,6 @@ class MainWindow(QMainWindow):
 
         dialog.setLayout(layout)
         dialog.exec_()
-
-    def reserve_seat(self, session, row, seat, seat_button):
-        if (row, seat) in session["seats"]:
-            session["seats"].remove((row, seat))
-            seat_button.setStyleSheet('color: #555555; border: 1px solid #D3D3D3; background-color: #D3D3D3; font-size: 10px;')
-            self.cur.execute("DELETE FROM reserved_seats WHERE session_id = %s AND row = %s AND seat = %s", (session["id"], row, seat))
-            self.conn.commit()
-        else:
-            session["seats"].add((row, seat))
-            seat_button.setStyleSheet('color: #FFFFFF; border: 1px solid #D3D3D3; background-color: #FF0000; font-size: 10px;')
-            self.cur.execute("INSERT INTO reserved_seats (session_id, row, seat) VALUES (%s, %s, %s)", (session["id"], row, seat))
-            self.conn.commit()
 
     def clear_window(self):
         for widget in self.findChildren(QWidget):
