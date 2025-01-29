@@ -1,4 +1,3 @@
-import sys
 from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QVBoxLayout, QWidget, QTabWidget, QScrollArea, QLineEdit, QComboBox, QDialog, QHBoxLayout, QMessageBox, QTimeEdit, QGridLayout
 from PyQt5.QtCore import QDate, QTime
 import psycopg2
@@ -28,6 +27,8 @@ class MainWindow(QMainWindow):
         self.hall_buttons = {}  # Инициализация словаря для хранения кнопок залов
         self.performance_buttons = {}  # Инициализация словаря для хранения кнопок спектаклей
         self.session_buttons = {}  # Инициализация словаря для хранения кнопок сеансов
+        self.editable = False  # Флаг для режима редактирования
+
         self.show_main_menu()
 
     def load_halls(self):
@@ -40,7 +41,24 @@ class MainWindow(QMainWindow):
 
     def load_sessions(self):
         self.cur.execute("SELECT s.id, s.date, s.hall_id, s.performance_id, s.time, s.price FROM sessions s")
-        sessions = [dict(id=row[0], date=row[1], hall_id=row[2], performance_id=row[3], time=row[4], price=row[5]) for row in self.cur.fetchall()]
+        sessions = []
+        for row in self.cur.fetchall():
+            hall_id = row[2]
+            performance_id = row[3]
+            hall = next((hall for hall in self.halls if hall["id"] == hall_id), None)
+            performance = next((performance for performance in self.performances if performance["id"] == performance_id), None)
+            session = dict(
+                id=row[0],
+                date=QDate.fromString(row[1].strftime('%Y-%m-%d'), 'yyyy-MM-dd'),
+                hall_id=hall_id,
+                performance_id=performance_id,
+                hall=hall,
+                performance=performance,
+                time=QTime.fromString(row[4].strftime('%H:%M:%S'), 'HH:mm:ss'),
+                price=row[5],
+                seats=set()
+            )
+            sessions.append(session)
         sessions_dict = {}
         for session in sessions:
             if session['date'] not in sessions_dict:
@@ -51,6 +69,16 @@ class MainWindow(QMainWindow):
     def load_hall_types(self):
         self.cur.execute("SELECT * FROM hall_types")
         return [dict(id=row[0], description=row[1], rows=row[2], seats=row[3]) for row in self.cur.fetchall()]
+
+    def load_reserved_seats(self):
+        self.cur.execute("SELECT session_id, row, seat FROM reserved_seats")
+        reserved_seats = self.cur.fetchall()
+        for session_id, row, seat in reserved_seats:
+            for session in self.sessions.values():
+                for s in session:
+                    if s["id"] == session_id:
+                        s["seats"].add((row, seat))
+                        break
 
     def add_hall(self):
         name = f"Зал {len(self.halls) + 1}"
@@ -76,6 +104,14 @@ class MainWindow(QMainWindow):
     def delete_hall(self, hall, dialog):
         reply = QMessageBox.question(self, 'Удаление зала', f"Вы уверены, что хотите удалить зал {hall['name']}?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
+            # Проверка наличия связанных сеансов
+            self.cur.execute("SELECT COUNT(*) FROM sessions WHERE hall_id = %s", (hall["id"],))
+            session_count = self.cur.fetchone()[0]
+            if session_count > 0:
+                QMessageBox.warning(self, "Ошибка", f"Невозможно удалить зал {hall['name']}, так как он используется в {session_count} сеансах.")
+                return
+
+            # Удаление зала
             self.cur.execute("DELETE FROM halls WHERE id = %s", (hall["id"],))
             self.conn.commit()
             self.halls.remove(hall)
@@ -102,6 +138,14 @@ class MainWindow(QMainWindow):
     def delete_performance(self, performance, dialog):
         reply = QMessageBox.question(self, 'Удаление спектакля', f"Вы уверены, что хотите удалить спектакль {performance['name']}?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
+            # Проверка наличия связанных сеансов
+            self.cur.execute("SELECT COUNT(*) FROM sessions WHERE performance_id = %s", (performance["id"],))
+            session_count = self.cur.fetchone()[0]
+            if session_count > 0:
+                QMessageBox.warning(self, "Ошибка", f"Невозможно удалить спектакль {performance['name']}, так как он используется в {session_count} сеансах.")
+                return
+
+            # Удаление спектакля
             self.cur.execute("DELETE FROM performances WHERE id = %s", (performance["id"],))
             self.conn.commit()
             self.performances.remove(performance)
@@ -128,6 +172,8 @@ class MainWindow(QMainWindow):
         session = {
             "id": session_id,
             "date": date,
+            "hall_id": hall["id"],
+            "performance_id": performance["id"],
             "hall": hall,
             "performance": performance,
             "time": QTime(19, 00),
@@ -155,12 +201,28 @@ class MainWindow(QMainWindow):
     def delete_session(self, session, dialog):
         reply = QMessageBox.question(self, 'Удаление сеанса', f"Вы уверены, что хотите удалить сеанс {session['id']}?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
-            self.cur.execute("DELETE FROM sessions WHERE id = %s", (session["id"],))
-            self.conn.commit()
-            self.sessions[session["date"]].remove(session)
-            self.session_buttons[session["id"]].deleteLater()
-            del self.session_buttons[session["id"]]
-            dialog.accept()
+            # Проверка наличия зарезервированных мест
+            self.cur.execute("SELECT COUNT(*) FROM reserved_seats WHERE session_id = %s", (session["id"],))
+            reserved_count = self.cur.fetchone()[0]
+            if reserved_count > 0:
+                QMessageBox.warning(self, "Внимание", f"Сеанс {session['id']} имеет {reserved_count} зарезервированных мест. Они будут автоматически удалены.")
+
+            # Удаление сеанса
+            try:
+                self.cur.execute("DELETE FROM sessions WHERE id = %s", (session["id"],))
+                self.conn.commit()
+                if session["date"] in self.sessions:
+                    self.sessions[session["date"]].remove(session)
+                    if not self.sessions[session["date"]]:
+                        del self.sessions[session["date"]]
+                if session["id"] in self.session_buttons:
+                    self.session_buttons[session["id"]].deleteLater()
+                    del self.session_buttons[session["id"]]
+                # Обновляем интерфейс
+                self.update_day_sessions(session["date"])
+            except psycopg2.Error as e:
+                QMessageBox.critical(self, "Ошибка", f"Не удалось удалить сеанс: {e}")
+                self.conn.rollback()
 
     def reserve_seat(self, session, row, seat, seat_button):
         if (row, seat) in session["seats"]:
@@ -170,12 +232,31 @@ class MainWindow(QMainWindow):
             self.conn.commit()
         else:
             session["seats"].add((row, seat))
-            seat_button.setStyleSheet('color: #FFFFF; border: 1px solid #D3D3D3; background-color: #FF0000; font-size: 10px;')
+            seat_button.setStyleSheet('color: #FFFFFF; border: 1px solid #D3D3D3; background-color: #FF0000; font-size: 10px;')
             self.cur.execute("INSERT INTO reserved_seats (session_id, row, seat) VALUES (%s, %s, %s)", (session["id"], row, seat))
             self.conn.commit()
 
+        # Обновляем интерфейс после изменения состояния мест
+        self.update_seat_buttons(session)
+
+    def update_seat_buttons(self, session):
+        hall = session["hall"]
+        if hall is None:
+            QMessageBox.warning(self, "Ошибка", "Зал для сеанса не выбран.")
+            return
+
+        for row in range(hall["rows"]):
+            for seat in range(hall["seats"]):
+                seat_button = self.findChild(QPushButton, f"seat_{row}_{seat}_{session['id']}")
+                if seat_button:
+                    if (row, seat) in session["seats"]:
+                        seat_button.setStyleSheet('color: #FFFFFF; border: 1px solid #D3D3D3; background-color: #FF0000; font-size: 10px;')
+                    else:
+                        seat_button.setStyleSheet('color: #555555; border: 1px solid #D3D3D3; background-color: #D3D3D3; font-size: 10px;')
+
     def show_main_menu(self):
         self.clear_window()
+        self.editable = False  # Устанавливаем режим просмотра
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -190,6 +271,7 @@ class MainWindow(QMainWindow):
 
     def show_sessions_menu(self):
         self.clear_window()
+        self.editable = False  # Устанавливаем режим просмотра
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -197,12 +279,13 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self.create_current_week_tab(False), "На тек. нед.")
-        self.tabs.addTab(self.create_next_week_tab(False), "На след. нед.")
+        self.tabs.addTab(self.create_current_week_tab(), "На тек. нед.")
+        self.tabs.addTab(self.create_next_week_tab(), "На след. нед.")
 
         back_button = QPushButton("Назад", self)
         back_button.setGeometry(700, 10, 80, 40)
-        back_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 16px; border-radius: 20px;')
+        back_button.setStyleSheet(
+            'color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 16px; border-radius: 20px;')
         back_button.clicked.connect(self.show_main_menu)
 
         layout.addWidget(self.tabs)
@@ -212,6 +295,7 @@ class MainWindow(QMainWindow):
 
     def show_edit_menu(self):
         self.clear_window()
+        self.editable = True  # Устанавливаем режим редактирования
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -389,7 +473,10 @@ class MainWindow(QMainWindow):
 
         session_button = QPushButton(session_name, self)
         session_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
-        session_button.clicked.connect(lambda: self.edit_session(session))
+        if self.editable:
+            session_button.clicked.connect(lambda: self.edit_session(session))
+        else:
+            session_button.clicked.connect(lambda: self.show_seat_selection_dialog(session))
         self.session_layout.addWidget(session_button)
         self.session_buttons[session["id"]] = session_button
 
@@ -451,7 +538,7 @@ class MainWindow(QMainWindow):
         dialog.setLayout(layout)
         dialog.exec_()
 
-    def create_current_week_tab(self, editable=True):
+    def create_current_week_tab(self):
         tab = QWidget()
         layout = QVBoxLayout()
 
@@ -463,13 +550,13 @@ class MainWindow(QMainWindow):
             day_date = start_of_week.addDays(i)
             day_button = QPushButton(f"{days[i]} {day_date.toString('dd.MM.yyyy')}", self)
             day_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 16px; border-radius: 20px;')
-            day_button.clicked.connect(lambda checked, date=day_date: self.show_day_sessions(date, editable))
+            day_button.clicked.connect(lambda checked, date=day_date: self.show_day_sessions(date))
             layout.addWidget(day_button)
 
         tab.setLayout(layout)
         return tab
 
-    def create_next_week_tab(self, editable=True):
+    def create_next_week_tab(self):
         tab = QWidget()
         layout = QVBoxLayout()
 
@@ -482,13 +569,14 @@ class MainWindow(QMainWindow):
             day_date = start_of_next_week.addDays(i)
             day_button = QPushButton(f"{days[i]} {day_date.toString('dd.MM.yyyy')}", self)
             day_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 16px; border-radius: 20px;')
-            day_button.clicked.connect(lambda checked, date=day_date: self.show_day_sessions(date, editable))
+            day_button.clicked.connect(lambda checked, date=day_date: self.show_day_sessions(date))
             layout.addWidget(day_button)
 
         tab.setLayout(layout)
         return tab
 
-    def show_day_sessions(self, date, editable=True):
+    def show_day_sessions(self, date):
+        self.load_reserved_seats()  # Обновляем забронированные места
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Сеансы на {date.toString('dd.MM.yyyy')}")
         dialog.setGeometry(100, 100, 600, 400)
@@ -496,21 +584,17 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout()
 
-        if editable:
+        if self.editable:
             add_session_button = QPushButton("+", self)
-            add_session_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 24px; border-radius: 25px;')
+            add_session_button.setStyleSheet(
+                'color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 24px; border-radius: 25px;')
             add_session_button.clicked.connect(lambda: self.add_session(date))
             layout.addWidget(add_session_button)
 
         self.session_layout = QVBoxLayout()
 
-        if date in self.sessions:
-            for session in self.sessions[date]:
-                session_name = f"{session['hall']['name']} - {session['performance']['name']} - {session['time'].toString('HH:mm')} - {session['price']} руб."
-                session_button = QPushButton(session_name, self)
-                session_button.setStyleSheet('color: #555555; border: 3px solid #D3D3D3; background-color: #D3D3D3; font-size: 20px; border-radius: 30px;')
-                session_button.clicked.connect(lambda checked, s=session: self.show_seat_selection_dialog(s))
-                self.session_layout.addWidget(session_button)
+        # Обновляем интерфейс сеансов
+        self.update_day_sessions(date)
 
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
@@ -521,6 +605,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(scroll_area)
         dialog.setLayout(layout)
         dialog.exec_()
+
+    def update_day_sessions(self, date):
+        self.load_reserved_seats()  # Обновляем забронированные места
+        # Очищаем текущий список сеансов для данной даты
+        for i in reversed(range(self.session_layout.count())):
+            widget = self.session_layout.itemAt(i).widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        # Загружаем актуальные сеансы из базы данных
+        self.sessions = self.load_sessions()
+
+        # Создаем новые кнопки для сеансов
+        if date in self.sessions:
+            for session in self.sessions[date]:
+                self.create_session_button(session)
 
     def show_seat_selection_dialog(self, session):
         dialog = QDialog(self)
@@ -540,9 +640,11 @@ class MainWindow(QMainWindow):
             for seat in range(hall["seats"]):
                 seat_button = QPushButton(f"{row+1}-{seat+1}", self)
                 seat_button.setFixedSize(30, 30)
-                seat_button.setStyleSheet('color: #555555; border: 1px solid #D3D3D3; background-color: #D3D3D3; font-size: 10px;')
+                seat_button.setObjectName(f"seat_{row}_{seat}_{session['id']}")
                 if (row, seat) in session["seats"]:
-                    seat_button.setStyleSheet('color: #555555; border: 1px solid #D3D3D3; background-color: #FF0000; font-size: 10px;')
+                    seat_button.setStyleSheet('color: #FFFFFF; border: 1px solid #D3D3D3; background-color: #FF0000; font-size: 10px;')
+                else:
+                    seat_button.setStyleSheet('color: #555555; border: 1px solid #D3D3D3; background-color: #D3D3D3; font-size: 10px;')
                 seat_button.clicked.connect(lambda checked, r=row, s=seat, b=seat_button: self.reserve_seat(session, r, s, b))
                 seats_layout.addWidget(seat_button, row, seat)
 
@@ -583,6 +685,7 @@ class MainWindow(QMainWindow):
         button.show()
 
 if __name__ == "__main__":
+    import sys
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
